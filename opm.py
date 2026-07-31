@@ -305,18 +305,18 @@ def clone_or_update_repo(repo_name, packages_cfg, force_update=False):
     repo_dir = os.path.join(CACHE_DIR, repo_name)
     
     if not os.path.exists(repo_dir):
-        print(f"[INFO] Cloning '{repo_name}' from {url}...")
+        print(f"[INFO] Cloning '{repo_name}' from {url} (Shallow Clone)...")
         os.makedirs(CACHE_DIR, exist_ok=True)
         try:
-            res = subprocess.run(['git', 'clone', url, repo_name], cwd=CACHE_DIR)
+            res = subprocess.run(['git', 'clone', '--depth', '1', url, repo_name], cwd=CACHE_DIR)
             return res.returncode == 0
         except Exception as e:
             print(f"[ERROR] Failed to clone '{repo_name}': {e}")
             return False
     elif force_update:
-        print(f"[INFO] Updating '{repo_name}'...")
+        print(f"[INFO] Updating '{repo_name}' (Shallow Fetch)...")
         try:
-            subprocess.run(['git', 'fetch', '--all'], cwd=repo_dir)
+            subprocess.run(['git', 'fetch', '--depth', '1', 'origin'], cwd=repo_dir)
             res = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_dir, capture_output=True, text=True)
             branch = res.stdout.strip()
             res_reset = subprocess.run(['git', 'reset', '--hard', f'origin/{branch}'], cwd=repo_dir)
