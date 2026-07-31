@@ -1,0 +1,48 @@
+repositories:
+  openclash:
+    url: https://github.com/vernesong/OpenClash.git
+    packages:
+      - luci-app-openclash
+
+  passwall:
+    url: https://github.com/xiaorouji/openwrt-passwall.git
+    packages:
+      - luci-app-passwall
+
+  passwall2:
+    url: https://github.com/xiaorouji/openwrt-passwall2.git
+    packages:
+      - luci-app-passwall2
+
+  homeproxy:
+    url: https://github.com/immortalwrt/homeproxy.git
+    packages:
+      - luci-app-homeproxy
+
+  kiddin9:
+    url: https://github.com/kiddin9/openwrt-packages.git
+    packages:
+      - luci-app-aria2
+      - luci-app-cloudflarespeedtest
+
+  small-package:
+    url: https://github.com/kenzok8/small-package.git
+    packages:
+      - luci-app-control-timewol
+      - luci-app-control-webrestriction
+      - luci-app-control-weburl
+      - luci-app-timecontrol
+      - luci-app-momo
+      - luci-app-nekobox
+      - luci-app-nikki
+      - luci-app-oaf
+      - luci-app-wolplus
+      - luci-app-vlmcsd
+      - luci-app-tcpdump
+      - luci-app-quickstart
+      - luci-app-turboacc
+      - luci-app-ikoolproxy
+      - luci-app-ssr-plus
+      - luci-app-store
+      - luci-app-openlist
+      - luci-app-lucky
