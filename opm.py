@@ -117,15 +117,148 @@ def load_packages_config():
     except ImportError:
         return parse_yaml(content)
 
+LEGACY_DEP_MAP = {
+    'ruby-yaml': 'ruby',
+    'luci-lib-jsonc': 'luci-base',
+    'php8-mod-curl': 'php8',
+    'php8-mod-intl': 'php8',
+    'php8-mod-fpm': 'php8',
+    'php8-mod-cgi': 'php8',
+    'ucode-mod-digest': 'ucode',
+    'wget': 'wget-ssl',
+    'xz': 'xz-utils',
+    'shadowsocks-rust-sslocal': 'shadowsocks-rust',
+    'shadowsocks-rust-ssserver': 'shadowsocks-rust',
+    'shadowsocksr-libev-ssr-local': 'shadowsocksr-libev',
+    'shadowsocksr-libev-ssr-redir': 'shadowsocksr-libev',
+    'shadowsocksr-libev-ssr-server': 'shadowsocksr-libev',
+}
+
+# Sub-package prefix families: any "prefix-xxx" maps to "prefix" (the parent package)
+SUBPKG_PREFIXES = ['coreutils-', 'shadow-', 'ruby-', 'php8-mod-', 'ucode-mod-']
+
+def patch_makefile_legacy_deps(makefile_path):
+    if not os.path.exists(makefile_path):
+        return
+    try:
+        with open(makefile_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+        modified = False
+        # Clean up any previously corrupted repetitive tokens
+        cleanups = [
+            (r'wget(-ssl)+', 'wget-ssl'),
+            (r'xz(-utils)+', 'xz-utils'),
+            (r'coreutils(-coreutils)+', 'coreutils'),
+        ]
+        for pattern, replacement in cleanups:
+            new_content = re.sub(pattern, replacement, content)
+            if new_content != content:
+                content = new_content
+                modified = True
+                
+        # Apply exact LEGACY_DEP_MAP replacements
+        for legacy, modern in LEGACY_DEP_MAP.items():
+            regex_pattern = r'(\+|\@|\:)' + re.escape(legacy) + r'(?=$|[\s/\:\\])'
+            new_content = re.sub(regex_pattern, r'\1' + modern, content)
+            if new_content != content:
+                content = new_content
+                modified = True
+        
+        # Apply sub-package prefix family replacements (e.g. +coreutils-base64 -> +coreutils)
+        for prefix in SUBPKG_PREFIXES:
+            parent = prefix.rstrip('-')
+            # Match +prefix-anything, @prefix-anything, :prefix-anything
+            regex_pattern = r'(\+|\@|\:)' + re.escape(prefix) + r'[a-zA-Z0-9_-]+(?=$|[\s/\:\\])'
+            new_content = re.sub(regex_pattern, r'\1' + parent, content)
+            if new_content != content:
+                content = new_content
+                modified = True
+                
+        # Strip defunct/archived optional dependencies (like kcptun) if not present in package tree
+        defunct_deps = ['kcptun-client', 'kcptun']
+        for df in defunct_deps:
+            regex_pattern = r'(\+|\@|\:)' + re.escape(df) + r'(?=$|[\s/\:\\])'
+            new_content = re.sub(regex_pattern, '', content)
+            if new_content != content:
+                content = new_content
+                modified = True
+        
+        # Remove ALL lines referencing defunct kcptun package (Kconfig blocks, inline deps, etc.)
+        # Real Makefile formats include:
+        #   config PACKAGE_xxx_INCLUDE_Kcptun        (Kconfig block header)
+        #       select PACKAGE_kcptun-client          (Kconfig select)
+        #   CONFIG_PACKAGE_$(PKG_NAME)_INCLUDE_Kcptun \   (conditional check)
+        #   +PACKAGE_$(PKG_NAME)_INCLUDE_Kcptun \         (conditional dependency)
+        lines = content.split('\n')
+        filtered_lines = [l for l in lines if 'kcptun' not in l.lower()]
+        if len(filtered_lines) != len(lines):
+            content = '\n'.join(filtered_lines)
+            modified = True
+        
+        # Deduplicate consecutive identical dependency tokens (e.g. +coreutils +coreutils -> +coreutils)
+        if modified:
+            content = re.sub(r'(\+\S+)((?:\s+\1)+)', r'\1', content)
+                
+        if modified:
+            with open(makefile_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"[INFO] Auto-patched legacy dependencies in '{os.path.relpath(makefile_path, OPENWRT_ROOT)}'")
+    except Exception:
+        pass
+
+def auto_patch_custom_makefiles():
+    custom_dir = os.path.join(OPENWRT_ROOT, 'package', 'custom')
+    if os.path.exists(custom_dir):
+        for root, dirs, files in os.walk(custom_dir):
+            if 'Makefile' in files:
+                patch_makefile_legacy_deps(os.path.join(root, 'Makefile'))
+
 def parse_dep_token(token):
-    token = token.strip().lstrip('+').lstrip('@').lstrip('!')
+    token = token.strip()
     if not token:
         return None
+    # If the token is a hardware or config dependency starting with '@', ignore it!
+    # E.g. @aarch64, @USE_MUSL, @TARGET_x86, @aarch64||arm||i386...
+    if token.startswith('@'):
+        return None
+        
+    # Strip leading +
+    token = token.lstrip('+')
+    
+    # If it is +@luci-base, after stripping + it becomes @luci-base.
+    # We should strip @ if it was prefixed with +!
+    token = token.lstrip('+').lstrip('@').lstrip('!')
+    
     if ':' in token:
         token = token.split(':')[-1]
+        
     token = token.lstrip('+').lstrip('@').lstrip('!')
     token = token.split('/')[0]
     token = token.strip('()')
+    
+    if token.startswith(('PACKAGE_', 'CONFIG_', 'BUSYBOX_', 'TARGET_')):
+        return None
+
+    if token in LEGACY_DEP_MAP:
+        token = LEGACY_DEP_MAP[token]
+    else:
+        # Check sub-package prefix families (e.g. coreutils-stty -> coreutils)
+        for prefix in SUBPKG_PREFIXES:
+            if token.startswith(prefix) and len(token) > len(prefix):
+                token = prefix.rstrip('-')
+                break
+        
+    if '||' in token or '&&' in token or not token:
+        return None
+        
+    if '$(' in token or '${' in token:
+        return None
+        
+    # Ignore config symbols (all uppercase with underscores)
+    if token.isupper() and '_' in token:
+        return None
+        
     return token
 
 def extract_packages_from_makefile(content):
@@ -140,14 +273,44 @@ def extract_packages_from_makefile(content):
         pkg_def = pkg_match.group(1).strip()
         if '/' in pkg_def:
             continue
-        if '$(PKG_NAME)' in pkg_def:
-            pkg_def = pkg_def.replace('$(PKG_NAME)', pkg_name_val)
-        if '${PKG_NAME}' in pkg_def:
-            pkg_def = pkg_def.replace('${PKG_NAME}', pkg_name_val)
+        if '$(' in pkg_def or '${' in pkg_def:
+            if '$(PKG_NAME)' in pkg_def:
+                pkg_def = pkg_def.replace('$(PKG_NAME)', pkg_name_val)
+            elif '${PKG_NAME}' in pkg_def:
+                pkg_def = pkg_def.replace('${PKG_NAME}', pkg_name_val)
+            else:
+                # Other template variables like $(1) or $(strip ...) should be ignored
+                continue
+        # Check again after replacement in case PKG_NAME itself contains variables
+        if '$(' in pkg_def or '${' in pkg_def:
+            continue
+        if not pkg_def or pkg_def.startswith('$'):
+            continue
+        if pkg_def in ('conffiles', 'description', 'install', 'postinst', 'prerm', 'postrm', 'config', 'data', 'headers'):
+            continue
         packages.append(pkg_def)
         
+    # Fallback 1: Use PKG_NAME if no define Package/ blocks found
     if not packages and pkg_name_val:
-        packages.append(pkg_name_val)
+        if '$(' not in pkg_name_val and '${' not in pkg_name_val:
+            if pkg_name_val not in ('conffiles', 'description', 'install', 'postinst', 'prerm', 'postrm', 'config', 'data', 'headers'):
+                packages.append(pkg_name_val)
+    
+    # Fallback 2: Parse $(eval $(call BuildPackage,<name>)) calls
+    # This handles LuCI template Makefiles that have no PKG_NAME and no define Package/ block
+    if not packages:
+        for bp_match in re.finditer(r'\$\(eval\s+\$\(call\s+(?:BuildPackage|KernelPackage)\s*,\s*([^)]+)\)\)', content):
+            bp_name = bp_match.group(1).strip()
+            # Resolve $(PKG_NAME) references
+            if '$(PKG_NAME)' in bp_name:
+                bp_name = bp_name.replace('$(PKG_NAME)', pkg_name_val)
+            if '${PKG_NAME}' in bp_name:
+                bp_name = bp_name.replace('${PKG_NAME}', pkg_name_val)
+            # Skip unresolved variables
+            if '$(' in bp_name or '${' in bp_name or not bp_name:
+                continue
+            if bp_name not in packages:
+                packages.append(bp_name)
         
     return packages
 
@@ -160,43 +323,43 @@ def extract_dependencies_from_makefile(content, pkg_name, pkg_name_val=None):
             
     deps = []
     
-    # 1. Parse LUCI_DEPENDS if we are looking for the main package's dependencies
-    if pkg_name_val and pkg_name == pkg_name_val:
-        in_luci_depends = False
-        luci_depends_lines = []
-        lines = content.splitlines()
-        for line in lines:
-            line_stripped = line.strip()
-            if not in_luci_depends:
-                m = re.match(r'^LUCI_DEPENDS\s*(?::=|=)\s*(.*)', line_stripped)
-                if m:
-                    in_luci_depends = True
-                    val = m.group(1)
-                    if val.endswith('\\'):
-                        luci_depends_lines.append(val[:-1].strip())
-                    else:
-                        luci_depends_lines.append(val.strip())
-                        break
-            else:
-                val = line_stripped
+    # 1. Parse LUCI_DEPENDS if present in Makefile
+    in_luci_depends = False
+    luci_depends_lines = []
+    lines = content.splitlines()
+    for line in lines:
+        line_stripped = line.strip()
+        if not in_luci_depends:
+            m = re.match(r'^LUCI_DEPENDS\s*(?::=|=)\s*(.*)', line_stripped)
+            if m:
+                in_luci_depends = True
+                val = m.group(1)
                 if val.endswith('\\'):
                     luci_depends_lines.append(val[:-1].strip())
                 else:
                     luci_depends_lines.append(val.strip())
                     break
-                    
-        if luci_depends_lines:
-            luci_depends_str = ' '.join(luci_depends_lines)
+        else:
+            val = line_stripped
+            if val.endswith('\\'):
+                luci_depends_lines.append(val[:-1].strip())
+            else:
+                luci_depends_lines.append(val.strip())
+                break
+                
+    if luci_depends_lines:
+        luci_depends_str = ' '.join(luci_depends_lines)
+        if pkg_name_val:
             luci_depends_str = luci_depends_str.replace('$(PKG_NAME)', pkg_name_val)
             luci_depends_str = luci_depends_str.replace('${PKG_NAME}', pkg_name_val)
-            for token in luci_depends_str.split():
-                dep = parse_dep_token(token)
-                if dep and dep not in deps:
-                    deps.append(dep)
-                    
+        for token in luci_depends_str.split():
+            dep = parse_dep_token(token)
+            if dep and dep not in deps:
+                deps.append(dep)
+                
     # 2. Parse block Package/pkg_name for DEPENDS
     patterns = [re.escape(pkg_name)]
-    if pkg_name_val and pkg_name == pkg_name_val:
+    if pkg_name_val:
         patterns.append(re.escape('$(PKG_NAME)'))
         patterns.append(re.escape('${PKG_NAME}'))
         
@@ -239,12 +402,12 @@ def extract_dependencies_from_makefile(content, pkg_name, pkg_name_val=None):
                 
     return deps
 
-def scan_directory_packages(directory):
+def scan_directory_packages(directory, use_dir_name_fallback=False):
     pkg_map = {}
     if not os.path.exists(directory):
         return pkg_map
         
-    for root, dirs, files in os.walk(directory):
+    for root, dirs, files in os.walk(directory, followlinks=True):
         dirs[:] = [d for d in dirs if not d.startswith('.')]
         if 'Makefile' in files:
             makefile_path = os.path.join(root, 'Makefile')
@@ -252,6 +415,11 @@ def scan_directory_packages(directory):
                 with open(makefile_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
                 pkgs = extract_packages_from_makefile(content)
+                # Fallback: use directory name if Makefile parsing returned nothing
+                if not pkgs and use_dir_name_fallback:
+                    dir_name = os.path.basename(root)
+                    if dir_name and not dir_name.startswith('.'):
+                        pkgs = [dir_name]
                 for pkg in pkgs:
                     if pkg not in pkg_map:
                         pkg_map[pkg] = []
@@ -261,7 +429,7 @@ def scan_directory_packages(directory):
     return pkg_map
 
 def scan_cache_packages(cache_dir):
-    return scan_directory_packages(cache_dir)
+    return scan_directory_packages(cache_dir, use_dir_name_fallback=True)
 
 # Global map to store installed packages
 INSTALLED_PKGS = {}
@@ -435,6 +603,9 @@ def resolve_and_sync(pkg_name, cache_pkg_map, synced_set, packages_cfg):
     synced_set.add(pkg_name)
     enable_in_config(pkg_name)
     
+    # Auto-patch legacy dependencies in the copied Makefile
+    patch_makefile_legacy_deps(os.path.join(dest_dir, 'Makefile'))
+    
     # Check dependencies of the synced package
     makefile_path = os.path.join(dest_dir, 'Makefile')
     if os.path.exists(makefile_path):
@@ -587,6 +758,9 @@ def cmd_doctor(args, packages_cfg):
     print("Running OPM Doctor Diagnostics...")
     print("=" * 60)
     
+    # Auto-patch any legacy dependencies in package/custom/ Makefiles first
+    auto_patch_custom_makefiles()
+    
     warnings = 0
     errors = 0
     
@@ -631,6 +805,8 @@ def cmd_doctor(args, packages_cfg):
     else:
         print("  No conflicts with feeds found.")
         
+    cache_pkg_map = scan_cache_packages(CACHE_DIR)
+    
     # 4. Check Makefile structure & satisfying dependencies for package/custom
     print("[4/4] Checking custom package Makefiles and dependencies...")
     if not os.path.exists(custom_dir):
@@ -654,11 +830,16 @@ def cmd_doctor(args, packages_cfg):
                     for dep in deps:
                         if dep in ('libc', 'libpthread', 'librt', 'libstdcpp', 'kernel', 'sstrip'):
                             continue
+                        if dep.startswith('kmod-'):
+                            continue
                         if dep not in all_pkgs:
                             # Check if it exists in packages.yml
                             repo = find_repo_for_package(dep, packages_cfg)
                             if repo:
-                                print(f"  [WARNING] Package '{pkg}' depends on '{dep}' which is in config but not yet synced.")
+                                print(f"  [WARNING] Package '{pkg}' depends on '{dep}' which is in config but not yet synced. Run sync to copy.")
+                                warnings += 1
+                            elif dep in cache_pkg_map:
+                                print(f"  [WARNING] Package '{pkg}' depends on '{dep}' which is available in cache but not yet synced. Run sync to copy.")
                                 warnings += 1
                             else:
                                 print(f"  [ERROR] Package '{pkg}' depends on '{dep}' which is missing from OpenWrt package tree.")

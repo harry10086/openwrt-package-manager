@@ -29,3 +29,5 @@ repositories:
       - luci-app-passwall2
       - luci-app-aria2
       - luci-app-cloudflarespeedtest
+
+
